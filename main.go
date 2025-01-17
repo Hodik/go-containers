@@ -1,8 +1,6 @@
 package main
 
 import (
-	"archive/tar"
-	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,7 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
+	"os/exec"
 	"strings"
 	"syscall"
 )
@@ -38,6 +36,16 @@ type TagResp struct {
 	} `json:"layers"`
 }
 
+type Config struct {
+	Env        []string `json:"Env"`
+	Cmd        []string `json:"Cmd"`
+	WorkingDir string   `json:"WorkingDir"`
+}
+
+type ConfigContainer struct {
+	Config Config `json:"Config"`
+}
+
 const registry = "https://registry-1.docker.io/v2"
 
 func main() {
@@ -58,28 +66,86 @@ func child() {
 	log.Printf("Running: %v as %d\n", os.Args[2:], os.Getpid())
 	image := os.Args[2]
 
-	image_name, filename :=	pull(image)
+	image_name, filename := pull(image)
 	log.Println("Pulling complete: ", image_name, filename)
+
+	imageConfig, err := readImageConfig(filename)
+
+	if err != nil {
+		log.Fatalln("Error reading image config: ", err.Error())
+	}
+
 	syscall.Sethostname([]byte(image_name))
 	syscall.Chroot(filename)
 	syscall.Chdir("/")
 	syscall.Mount("proc", "proc", "proc", 0, "")
-	config := syscall.ProcAttr{
-		Files: []uintptr{os.Stdin.Fd(), os.Stdout.Fd(), os.Stderr.Fd()},
+	cmd, err := applyImageConfig(imageConfig)
+	if err != nil {
+		log.Fatalln("Error applying image config: ", err.Error())
 	}
 
-	var process_args []string 
-	if len(os.Args) >= 4 {
-		process_args = os.Args[4:]
+	config := syscall.ProcAttr{
+		Files: []uintptr{os.Stdin.Fd(), os.Stdout.Fd(), os.Stderr.Fd()},
+		Env:   os.Environ(),
+	}
+
+	var process_args []string
+	var process string
+
+	if len(os.Args) > 3 {
+		process = os.Args[3]
+
+		if len(os.Args) >= 4 {
+			process_args = os.Args[4:]
+		}
+	} else if cmd != nil {
+		process = cmd[0]
+
+		if len(cmd) > 1 {
+			process_args = cmd[1:]
+		}
 	} else {
-		process_args = []string{}
+		log.Fatalln("No cmd provided, no cmd in set in image")
 	}
-	childPid, _, err := syscall.StartProcess(os.Args[3], process_args, &config)
+	childPid, _, err := syscall.StartProcess(process, process_args, &config)
 	if err != nil {
-		log.Fatalln("Error executing program", os.Args[3], process_args, err.Error())
+		log.Fatalln("Error executing program", process, process_args, err.Error())
 	}
+	log.Println("Started", process, process_args, " process with pid", childPid)
 	syscall.Wait4(int(childPid), nil, 0, nil)
 	syscall.Unmount("proc", 0)
+
+	log.Println("Finishing child container process")
+}
+
+func readImageConfig(imageDir string) (*Config, error) {
+	file, err := os.Open(fmt.Sprintf("%s/config.json", imageDir))
+
+	if err != nil {
+		return nil, err
+	}
+
+	var configContainer ConfigContainer
+	if err := json.NewDecoder(file).Decode(&configContainer); err != nil {
+		return nil, err
+	}
+
+	return &configContainer.Config, nil
+}
+
+func applyImageConfig(c *Config) ([]string, error) {
+	for _, envVar := range c.Env {
+		parsedVar := strings.Split(envVar, "=")
+
+		log.Println("Applying env", parsedVar)
+		if err := os.Setenv(parsedVar[0], parsedVar[1]); err != nil {
+			return nil, err
+		}
+	}
+	if err := syscall.Chdir(c.WorkingDir); err != nil {
+		return nil, err
+	}
+	return c.Cmd, nil
 }
 
 func run() {
@@ -133,20 +199,60 @@ func pullImage(imageName string, tag string, outputDir string) {
 
 	err = os.MkdirAll(outputDir, 0755)
 	if err != nil {
-		log.Fatalf("failed to create output directory: %w", err)
+		log.Fatalf("failed to create output directory: %s", err.Error())
 	}
 
 	if err != nil {
 		log.Fatalln(err.Error())
 	}
 
+	c, err := fetchConfig(imageName, tagResp.Config.Digest, token)
+
+	if err != nil {
+		log.Fatalln("Error pulling image config:", err.Error())
+	}
+
+	if err := extractConfig(c, outputDir); err != nil {
+		log.Fatalln("Error extracting config into image fs", err.Error())
+	}
+
 	for _, layer := range tagResp.Layers {
 		log.Println("Downloading layer: ", layer.Digest)
 		if err := downloadAndExtractLayer(imageName, layer.Digest, token, outputDir); err != nil {
-			log.Fatalf("failed to process layer %s: %w", layer.Digest, err)
+			log.Fatalf("failed to process layer %s: %s", layer.Digest, err.Error())
 		}
 	}
 
+}
+
+func extractConfig(c []byte, outputDir string) error {
+	file, err := os.Create(fmt.Sprintf("%s/config.json", outputDir))
+
+	if err != nil {
+		return err
+	}
+
+	if _, err := file.Write(c); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func fetchConfig(image, digest, token string) ([]byte, error) {
+	// Construct the URL to fetch the layer blob.
+	url := fmt.Sprintf("%s/%s/blobs/%s", registry, image, digest)
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	// Make the HTTP request to download the layer.
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to download layer: %w", err)
+	}
+	defer resp.Body.Close()
+
+	return io.ReadAll(resp.Body)
 }
 
 func fetchToken(imageName string) (string, error) {
@@ -239,59 +345,50 @@ func fetchTag(image, tag, token string) (*TagResp, error) {
 }
 
 func downloadAndExtractLayer(image, digest, token, outputDir string) error {
+	// Construct the URL to fetch the layer blob.
 	url := fmt.Sprintf("%s/%s/blobs/%s", registry, image, digest)
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 
+	// Make the HTTP request to download the layer.
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to download layer: %w", err)
 	}
 	defer resp.Body.Close()
 
+	// Check if the HTTP status code is OK.
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("failed to download layer: %s", resp.Status)
 	}
 
-	return extractTarGz(resp.Body, outputDir)
-}
-
-func extractTarGz(reader io.Reader, outputDir string) error {
-	gzipReader, err := gzip.NewReader(reader)
+	// Create a temporary file to store the downloaded layer.
+	tmpFile, err := os.Create("/tmp/layer.tar")
 	if err != nil {
-		return fmt.Errorf("failed to create gzip reader: %w", err)
+		return fmt.Errorf("failed to create temporary file: %w", err)
 	}
-	defer gzipReader.Close()
+	defer tmpFile.Close()
 
-	tarReader := tar.NewReader(gzipReader)
-	for {
-		header, err := tarReader.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("failed to read tar header: %w", err)
-		}
-
-		target := filepath.Join(outputDir, header.Name)
-		switch header.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(target, 0755); err != nil {
-				return fmt.Errorf("failed to create directory: %w", err)
-			}
-		case tar.TypeReg:
-			outFile, err := os.Create(target)
-			if err != nil {
-				return fmt.Errorf("failed to create file: %w", err)
-			}
-			if _, err := io.Copy(outFile, tarReader); err != nil {
-				outFile.Close()
-				return fmt.Errorf("failed to write file: %w", err)
-			}
-			outFile.Close()
-		default:
-			fmt.Println("Skipping unknown tar header type:", header.Typeflag)
-		}
+	// Write the response body (layer blob) to the temp file.
+	_, err = io.Copy(tmpFile, resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to write layer blob to file: %w", err)
 	}
+
+	// Now, use `tar` command to extract the layer into the output directory.
+	// Use `tar xf` to extract the tarball.
+	cmd := exec.Command("/usr/bin/tar", "xf", tmpFile.Name(), "-C", outputDir)
+	err = cmd.Run()
+	if err != nil {
+		return fmt.Errorf("failed to extract layer: %w", err)
+	}
+
+	// Clean up the temporary file after extraction.
+	err = os.Remove(tmpFile.Name())
+	if err != nil {
+		log.Printf("Warning: failed to remove temporary tar file: %v", err)
+	}
+
+	log.Println("Layer extracted successfully.")
 	return nil
 }
