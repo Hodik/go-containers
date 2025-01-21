@@ -111,7 +111,6 @@ func child() {
 	} else {
 		log.Fatalln("No cmd provided, no cmd in set in image")
 	}
-
 	var childPid int
 	if strings.Contains(process, "/bin/") {
 		childPid, _, err = syscall.StartProcess(process, process_args, &config)
