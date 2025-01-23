@@ -2,12 +2,15 @@ package main
 
 import (
 	"fmt"
-	"golang.org/x/sys/unix"
 	"log"
+	"math/rand"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 func generateMAC(uuid string) string {
@@ -32,6 +35,10 @@ func generateIP(uuid string) string {
 
 	cleaned := strings.ReplaceAll(lastThree, "0", "")
 
+  if cleaned == "1" {
+    r := rand.Intn(98) + 1
+    return strconv.Itoa(r)
+  }
 	return cleaned
 }
 
@@ -47,15 +54,24 @@ func SetupNet(contUuid string) error {
 			return err
 		}
 	}
-	if err := ExecCommand(fmt.Sprintf("sudo ip link add dev veth0_%s type veth peer name veth1_%s", contUuid, contUuid)); err != nil {
+
+  if err := ExecCommand(fmt.Sprintf("ip addr add 172.18.0.1/16 dev bridge0")); err != nil {
+    log.Println("Error assigning ip to bridge0: ", err.Error(), ", continuing...")
+	}
+
+  if err := ExecCommand(fmt.Sprintf("ip link set bridge0 up")); err != nil {
 		return err
 	}
 
-	if err := ExecCommand(fmt.Sprintf("ip link set dev veth0_%s up", contUuid)); err != nil {
+  if err := ExecCommand(fmt.Sprintf("ip link add dev veth_%s type veth peer name ceth_%s", contUuid, contUuid)); err != nil {
 		return err
 	}
 
-	if err := ExecCommand(fmt.Sprintf("ip link set veth0_%s master bridge0", contUuid)); err != nil {
+	if err := ExecCommand(fmt.Sprintf("ip link set dev veth_%s up", contUuid)); err != nil {
+		return err
+	}
+
+	if err := ExecCommand(fmt.Sprintf("ip link set veth_%s master bridge0", contUuid)); err != nil {
 		return err
 	}
 
@@ -63,7 +79,7 @@ func SetupNet(contUuid string) error {
 		return err
 	}
 
-	if err := ExecCommand(fmt.Sprintf("ip link set veth1_%s netns netns_%s", contUuid, contUuid)); err != nil {
+	if err := ExecCommand(fmt.Sprintf("ip link set ceth_%s netns netns_%s", contUuid, contUuid)); err != nil {
 		return err
 	}
 
@@ -71,19 +87,19 @@ func SetupNet(contUuid string) error {
 		return err
 	}
 
-	if err := ExecCommand(fmt.Sprintf("ip netns exec netns_%s ip link set veth1_%s address 02:42:ac:11:00%s", contUuid, contUuid, mac)); err != nil {
+	if err := ExecCommand(fmt.Sprintf("ip netns exec netns_%s ip link set dev ceth_%s up", contUuid, contUuid)); err != nil {
 		return err
 	}
 
-	if err := ExecCommand(fmt.Sprintf("ip netns exec netns_%s ip addr add 10.0.0.%s/24 dev veth1_%s", contUuid, ip, contUuid)); err != nil {
+	if err := ExecCommand(fmt.Sprintf("ip netns exec netns_%s ip addr add 172.18.0.%s/24 dev ceth_%s", contUuid, ip, contUuid)); err != nil {
 		return err
 	}
 
-	if err := ExecCommand(fmt.Sprintf("ip netns exec netns_%s ip link set dev veth1_%s up", contUuid, contUuid)); err != nil {
+	if err := ExecCommand(fmt.Sprintf("ip netns exec netns_%s ip route add default via 172.18.0.1", contUuid)); err != nil {
 		return err
 	}
-
-	if err := ExecCommand(fmt.Sprintf("ip netns exec netns_%s ip route add default via 10.0.0.1", contUuid)); err != nil {
+  
+  if err := ExecCommand(fmt.Sprintf("iptables -t nat -A POSTROUTING -s 172.18.0.0/16 ! -o bridge0 -j MASQUERADE")); err != nil {
 		return err
 	}
 
@@ -92,7 +108,7 @@ func SetupNet(contUuid string) error {
 
 func CleanupNet(contUuid string) error {
 	log.Println("net cleanup")
-	if err := ExecCommand(fmt.Sprintf("ip link del dev veth0_%s", contUuid)); err != nil {
+	if err := ExecCommand(fmt.Sprintf("ip link del dev veth_%s", contUuid)); err != nil {
 		return err
 	}
 	if err := ExecCommand(fmt.Sprintf("ip netns del netns_%s", contUuid)); err != nil {
