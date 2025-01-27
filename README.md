@@ -55,9 +55,11 @@ This project is a lightweight alternative to Docker, designed for learning purpo
 
 ## Running Containers
 
-1. ```go run . run <imagename>:<tag> <command>
+1. ```bash 
+    go run . run <imagename>:<tag> <command>
 
 for example:
 
-```go run . run library/redis:latest /bin/sh
+```bash
+go run . run library/redis:latest /bin/sh
 
