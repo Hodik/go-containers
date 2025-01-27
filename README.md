@@ -50,3 +50,13 @@ This project is a lightweight alternative to Docker, designed for learning purpo
    ```bash
    git clone <repository-url>
    cd <repository-directory>
+
+---
+
+## Running Containers
+
+1. go run . run <imagename>:<tag> <command>
+
+for example:
+
+go run . run library/redis:latest /bin/sh
